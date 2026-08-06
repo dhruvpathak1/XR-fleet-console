@@ -80,7 +80,7 @@ The panel in the top left shows live statistics. The one worth watching is **dra
 
 
 To try the VR view without owning a headset, install the free
-[WebXR API Emulator](https://chromewebstore.google.com/detail/webxr-api-emulator/mjddjgeghkdijejnciaefnkjmkafnnje)
+[WebXR API Emulator]([https://chromewebstore.google.com/detail/webxr-api-emulator/mjddjgeghkdijejnciaefnkjmkafnnje](https://chromewebstore.google.com/detail/immersive-web-emulator/cgffilbpcibhmcfbgggfhfolhkfbhmik?hl=en))
 extension for Chrome, then open DevTools (F12), find the **WebXR** tab, and pick a device. The "Enter VR" button will start working.
 
 ## How it works
