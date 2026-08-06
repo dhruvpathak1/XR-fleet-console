@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>XR Fleet Operations Console</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0d12;
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #cfe3ff; }
+  #hud { position: fixed; top: 12px; left: 12px; z-index: 10; font-size: 12px; line-height: 1.55;
+         background: rgba(10,14,20,.82); border: 1px solid #1e2a3a; border-radius: 8px;
+         padding: 10px 12px; min-width: 232px; backdrop-filter: blur(6px); }
+  #hud h1 { margin: 0 0 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #7fb2ff; }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .row span:last-child { color: #eaf3ff; font-variant-numeric: tabular-nums; }
+  #hud .warn { color: #ffb454; }
+  #hud .bad { color: #ff6b6b; }
+  #controls { position: fixed; bottom: 12px; left: 12px; z-index: 10; display: flex; gap: 6px; flex-wrap: wrap; max-width: 60vw; }
+  button, select { background: #16202e; color: #cfe3ff; border: 1px solid #24344a; border-radius: 6px;
+                   padding: 6px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  button:hover { background: #1d2a3c; }
+  #hint { position: fixed; bottom: 12px; right: 12px; z-index: 10; font-size: 11px; color: #6c8199; text-align: right; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <h1>Fleet Ops Console</h1>
+  <div class="row"><span>fps</span><span id="m-fps">-</span></div>
+  <div class="row"><span>cpu frame</span><span id="m-cpu">-</span></div>
+  <div class="row"><span>budget @72Hz</span><span id="m-budget">13.9 ms</span></div>
+  <div class="row"><span>draw calls</span><span id="m-draws">-</span></div>
+  <div class="row"><span>robots</span><span id="m-robots">-</span></div>
+  <div class="row"><span>server tick</span><span id="m-tick">-</span></div>
+  <div class="row"><span>net latency</span><span id="m-lat">-</span></div>
+  <div class="row"><span>selected</span><span id="m-sel">none</span></div>
+</div>
+
+<div id="controls">
+  <button id="btn-scatter">Scatter goals</button>
+  <button id="btn-pause">Pause</button>
+  <select id="sel-count">
+    <option value="100">100 robots</option>
+    <option value="500" selected>500 robots</option>
+    <option value="1500">1500 robots</option>
+    <option value="3000">3000 robots</option>
+  </select>
+</div>
+
+<div id="hint">
+  desktop: drag to orbit, click a robot to select, click the floor to send it there<br>
+  xr: trigger to select, trigger on floor to command
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+// ===========================================================================
+// 1. WIRE PROTOCOL
+// ===========================================================================
+// Must match server/main.py exactly. Header is 16 bytes, each robot 24 bytes.
+const HEADER_BYTES = 16;
+const ROBOT_BYTES  = 24;   // x, z, heading, speed, status, kind  (6 x float32)
+const ROBOT_FLOATS = 6;
+
+// Render this far behind the newest snapshot. The server ticks every 50 ms, so
+// we sit one full tick in the past and always have two snapshots to interpolate
+// between. Without this the renderer would constantly be extrapolating past the
+// newest data and you would see stutter every time a packet arrived late.
+const INTERP_DELAY_MS = 60;
+
+let MAX_ROBOTS = 4000;      // buffer capacity, grown if the server sends more
+let robotCount = 0;
+let gridN = 40, cellSize = 1.5, tickHz = 20;
+
+// Two snapshots: previous and current. Each is a flat Float32Array, laid out
+// exactly like the wire format so we can copy straight in with no per-robot
+// object allocation. Allocating 500 objects per tick is how you turn a smooth
+// demo into a garbage collection sawtooth.
+let prevData = new Float32Array(MAX_ROBOTS * ROBOT_FLOATS);
+let currData = new Float32Array(MAX_ROBOTS * ROBOT_FLOATS);
+let prevTime = 0, currTime = 0;
+
+// ===========================================================================
+// 2. SCENE
+// ===========================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;                       // <- this is the whole "WebXR" switch
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+// VRButton prints "WEBXR NOT AVAILABLE" when navigator.xr is missing, which
+// looks like a failure but simply means this browser has no XR runtime. Say so
+// plainly rather than leaving a scary red banner unexplained.
+if (!navigator.xr) {
+  const note = document.createElement('div');
+  note.style.cssText = 'position:fixed;bottom:64px;left:50%;transform:translateX(-50%);' +
+    'z-index:10;font-size:11px;color:#6c8199;text-align:center;max-width:70vw';
+  note.innerHTML = 'No WebXR runtime in this browser. The desktop view below is fully functional. ' +
+    'For the immersive path, install the <b>WebXR API Emulator</b> Chrome extension ' +
+    'and pick a device in DevTools &rarr; WebXR.';
+  document.body.appendChild(note);
+}
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0d12);
+scene.fog = new THREE.Fog(0x0a0d12, 90, 260);   // must start well beyond the
+                                                // camera distance or the whole
+                                                // floor fades into background
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 600);
+camera.position.set(0, 40, 48);
+
+// Everything lives under a rig so the world can be rescaled as a unit.
+//
+// On desktop the rig is 1:1 and the camera flies around a 60-unit warehouse.
+// In XR the headset owns the camera, so instead of moving the camera we shrink
+// the world into a tabletop diorama in front of the user. Scaling the rig on
+// session start and restoring it on session end is the standard "miniature
+// world" pattern.
+//
+// This was a bug in the first version: the rig was permanently scaled to 0.06,
+// so on desktop the whole warehouse was a 3.6-unit speck 58 units from the
+// camera, half swallowed by fog, and effectively impossible to click.
+const WORLD_SCALE_DESKTOP = 1;
+const WORLD_SCALE_XR = 0.03;          // 60-unit floor becomes a 1.8 m table
+
+const rig = new THREE.Group();
+rig.scale.setScalar(WORLD_SCALE_DESKTOP);
+scene.add(rig);
+
+renderer.xr.addEventListener('sessionstart', () => {
+  rig.scale.setScalar(WORLD_SCALE_XR);
+  rig.position.set(0, 0.9, -1.2);     // waist height, just in front of you
+});
+renderer.xr.addEventListener('sessionend', () => {
+  rig.scale.setScalar(WORLD_SCALE_DESKTOP);
+  rig.position.set(0, 0, 0);
+});
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+// Floor + grid. One mesh, one grid helper: 2 draw calls, constant.
+const floorSize = gridN * cellSize;
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(floorSize, floorSize),
+  new THREE.MeshBasicMaterial({ color: 0x0e141d })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.01;
+rig.add(floor);
+
+const grid = new THREE.GridHelper(floorSize, gridN, 0x1b2838, 0x141d29);
+rig.add(grid);
+
+// ===========================================================================
+// 3. THE INSTANCED FLEET  (the part that matters)
+// ===========================================================================
+// ONE InstancedMesh for the entire fleet. 500 robots is 1 draw call, not 500.
+// Draw calls are the thing that kills XR frame budgets, not triangle count:
+// every call is CPU-side driver validation and state setup, and you pay it
+// twice because XR renders both eyes.
+// Sized to most of a 1.5-unit cell: big enough to be a comfortable click
+// target from the default camera distance, small enough that neighbouring
+// robots never visually touch.
+const body = new THREE.BoxGeometry(0.9, 0.6, 1.2);
+
+// Per-instance data that the shader reads. These are InstancedBufferAttributes:
+// one value per robot, uploaded once per frame as a contiguous buffer.
+const aStatus = new THREE.InstancedBufferAttribute(new Float32Array(MAX_ROBOTS), 1);
+const aKind   = new THREE.InstancedBufferAttribute(new Float32Array(MAX_ROBOTS), 1);
+const aSpeed  = new THREE.InstancedBufferAttribute(new Float32Array(MAX_ROBOTS), 1);
+const aId     = new THREE.InstancedBufferAttribute(new Float32Array(MAX_ROBOTS), 1);
+for (let i = 0; i < MAX_ROBOTS; i++) aId.array[i] = i;
+
+body.setAttribute('aStatus', aStatus);
+body.setAttribute('aKind',   aKind);
+body.setAttribute('aSpeed',  aSpeed);
+body.setAttribute('aId',     aId);
+
+const fleetMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime:       { value: 0 },
+    uSelectedId: { value: -1 },
+    uMaxSpeed:   { value: 4.6 },
+  },
+
+  // -------------------------------------------------------------------------
+  // VERTEX SHADER
+  // -------------------------------------------------------------------------
+  // three.js injects `attribute mat4 instanceMatrix;` automatically when this
+  // material is used on an InstancedMesh (it defines USE_INSTANCING for us).
+  // The per-robot transform therefore never touches the JS side of the frame
+  // loop beyond writing into the matrix buffer.
+  vertexShader: /* glsl */`
+    attribute float aStatus;
+    attribute float aKind;
+    attribute float aSpeed;
+    attribute float aId;
+
+    uniform float uTime;
+    uniform float uSelectedId;
+
+    varying float vStatus;
+    varying float vSpeed;
+    varying float vSelected;
+    varying vec3  vNormalView;
+
+    void main() {
+      vStatus   = aStatus;
+      vSpeed    = aSpeed;
+      vSelected = (abs(aId - uSelectedId) < 0.5) ? 1.0 : 0.0;
+
+      vec3 transformed = position;
+
+      // Aerial robots hover and bob. This is done on the GPU, per vertex,
+      // from a uniform clock. Doing it on the CPU would mean rewriting 500
+      // instance matrices every frame for a purely cosmetic effect.
+      //
+      // EXERCISE 1: change the 0.35 and the 2.2 below and watch what happens.
+      // Then work out why aId is multiplied in: without it every aerial robot
+      // bobs in perfect unison, which reads as fake immediately.
+      if (aKind > 0.5) {
+        transformed.y += 2.4 + sin(uTime * 2.2 + aId * 0.7) * 0.35;
+      }
+
+      // Selected robot inflates slightly so it is findable in a crowd.
+      transformed *= 1.0 + vSelected * 0.85;
+
+      vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(transformed, 1.0);
+
+      // Normal into view space. normalMatrix does not know about the instance
+      // rotation, so we apply the instance matrix's upper 3x3 first.
+      vNormalView = normalize(normalMatrix * mat3(instanceMatrix) * normal);
+
+      gl_Position = projectionMatrix * mvPosition;
+    }
+  `,
+
+  // -------------------------------------------------------------------------
+  // FRAGMENT SHADER
+  // -------------------------------------------------------------------------
+  fragmentShader: /* glsl */`
+    precision highp float;
+
+    uniform float uTime;
+    uniform float uMaxSpeed;
+
+    varying float vStatus;
+    varying float vSpeed;
+    varying float vSelected;
+    varying vec3  vNormalView;
+
+    void main() {
+      // Speed ramp: dim blue when crawling, cyan-green at cruise.
+      float t = clamp(vSpeed / uMaxSpeed, 0.0, 1.0);
+      vec3 col = mix(vec3(0.11, 0.28, 0.62), vec3(0.25, 0.92, 0.72), t);
+
+      // status 2.0 == blocked. Amber, so contention is visible at a glance
+      // across the whole floor. This is the single most useful thing an
+      // operator wants to see in a fleet view.
+      if (vStatus > 1.5) col = vec3(1.0, 0.62, 0.16);
+      // status 0.0 == idle. Desaturate so idle robots recede.
+      else if (vStatus < 0.5) col = vec3(0.22, 0.27, 0.34);
+
+      // Cheap directional lambert. No lights in the scene, no light uniforms
+      // to upload, no shadow maps: for 3000 instances this matters.
+      vec3 lightDir = normalize(vec3(0.4, 0.9, 0.35));
+      float lambert = 0.35 + 0.65 * max(dot(normalize(vNormalView), lightDir), 0.0);
+      col *= lambert;
+
+      // EXERCISE 2: the selection pulse. Work out why sin() is remapped with
+      // *0.5+0.5 before it is used as a mix factor. What would a raw sin()
+      // do to the colour, and why is that wrong?
+      float pulse = sin(uTime * 6.0) * 0.5 + 0.5;
+      col = mix(col, vec3(1.0, 1.0, 1.0), vSelected * (0.35 + 0.4 * pulse));
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+});
+
+const fleetMesh = new THREE.InstancedMesh(body, fleetMaterial, MAX_ROBOTS);
+fleetMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);  // tells GL we rewrite this every frame
+fleetMesh.frustumCulled = false;                            // instances span the whole floor
+fleetMesh.count = 0;
+
+// InstancedMesh.raycast() bails out early if the ray misses the bounding
+// sphere. three.js would otherwise compute that sphere lazily, ONCE, and cache
+// it, which is wrong here for two reasons: at first raycast count may still be
+// 0, and the robots move every frame afterwards so any cached sphere goes
+// stale. We just declare a sphere big enough to contain the entire floor plus
+// the hover height of the aerial robots, and never recompute it.
+const worldRadius = Math.hypot(gridN * cellSize, gridN * cellSize) * 0.5 + 6;
+fleetMesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1.5, 0), worldRadius);
+fleetMesh.computeBoundingSphere = () => {};   // keep three from overwriting it
+
+rig.add(fleetMesh);
+
+// Reused scratch objects. Allocating a Matrix4 per robot per frame would mean
+// 500 * 72 = 36,000 allocations a second feeding the garbage collector.
+const _m = new THREE.Matrix4();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const _p = new THREE.Vector3();
+const _s = new THREE.Vector3(1, 1, 1);
+
+// ===========================================================================
+// 4. NETWORK
+// ===========================================================================
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+let ws, lastPacketAt = 0, netLatency = 0;
+
+function connect() {
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'hello') {
+        gridN = msg.grid_n; cellSize = msg.cell; tickHz = msg.tick_hz;
+        robotCount = msg.robot_count;
+      }
+      return;
+    }
+
+    const now = performance.now();
+    if (lastPacketAt) netLatency = netLatency * 0.9 + (now - lastPacketAt) * 0.1;
+    lastPacketAt = now;
+
+    const view = new DataView(ev.data);
+    const count = view.getUint32(8, true);
+
+    if (count * ROBOT_FLOATS > currData.length) {
+      MAX_ROBOTS = count;
+      prevData = new Float32Array(count * ROBOT_FLOATS);
+      currData = new Float32Array(count * ROBOT_FLOATS);
+    }
+
+    // Roll current -> previous, then read the new frame straight out of the
+    // ArrayBuffer. One typed-array copy, no object churn.
+    prevData.set(currData.subarray(0, count * ROBOT_FLOATS));
+    prevTime = currTime;
+    currTime = now;
+
+    const incoming = new Float32Array(ev.data, HEADER_BYTES, count * ROBOT_FLOATS);
+    currData.set(incoming);
+    robotCount = count;
+    fleetMesh.count = count;
+
+    document.getElementById('m-tick').textContent = view.getUint32(0, true);
+  };
+
+  ws.onclose = () => setTimeout(connect, 1000);
+}
+connect();
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// ===========================================================================
+// 5. SELECTION AND COMMANDING
+// ===========================================================================
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let selectedId = -1;
+
+function worldToCell(x, z) {
+  const half = (gridN - 1) / 2;
+  return {
+    gx: Math.round(x / cellSize + half),
+    gz: Math.round(z / cellSize + half),
+  };
+}
+
+function pick(originRay) {
+  raycaster.set(originRay.origin, originRay.direction);
+
+  const hitRobot = raycaster.intersectObject(fleetMesh, false)[0];
+  if (hitRobot && hitRobot.instanceId !== undefined) {
+    selectedId = hitRobot.instanceId;
+    fleetMaterial.uniforms.uSelectedId.value = selectedId;
+    document.getElementById('m-sel').textContent = '#' + selectedId;
+    return;
+  }
+
+  if (selectedId >= 0) {
+    const hitFloor = raycaster.intersectObject(floor, false)[0];
+    if (hitFloor) {
+      // The rig is scaled, so the hit point must come back into rig-local
+      // space before it means anything in grid coordinates.
+      const local = rig.worldToLocal(hitFloor.point.clone());
+      const { gx, gz } = worldToCell(local.x, local.z);
+      send({ type: 'assign_goal', id: selectedId, gx, gz });
+    }
+  }
+}
+
+// Distinguish a click from an orbit drag. OrbitControls also listens on this
+// element, so without this every camera drag would fire a selection on release.
+let downX = 0, downY = 0;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  downX = e.clientX; downY = e.clientY;
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (renderer.xr.isPresenting) return;
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return;  // was a drag
+  pointer.x = (e.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  pick({ origin: raycaster.ray.origin, direction: raycaster.ray.direction });
+});
+
+// XR controllers. Trigger press casts a ray straight down -Z from the
+// controller, which is the convention every XR runtime uses.
+const tmpMatrix = new THREE.Matrix4();
+for (const i of [0, 1]) {
+  const controller = renderer.xr.getController(i);
+  controller.addEventListener('selectstart', () => {
+    tmpMatrix.identity().extractRotation(controller.matrixWorld);
+    const origin = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
+    const direction = new THREE.Vector3(0, 0, -1).applyMatrix4(tmpMatrix);
+    pick({ origin, direction });
+  });
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]),
+    new THREE.LineBasicMaterial({ color: 0x7fb2ff })
+  );
+  controller.add(line);
+  scene.add(controller);
+}
+
+document.getElementById('btn-scatter').onclick = () => send({ type: 'scatter' });
+let paused = false;
+document.getElementById('btn-pause').onclick = (e) => {
+  paused = !paused;
+  send({ type: paused ? 'pause' : 'resume' });
+  e.target.textContent = paused ? 'Resume' : 'Pause';
+};
+document.getElementById('sel-count').onchange = (e) =>
+  send({ type: 'set_count', n: parseInt(e.target.value, 10) });
+
+// ===========================================================================
+// 6. RENDER LOOP
+// ===========================================================================
+let frames = 0, fpsAccum = 0, cpuAccum = 0;
+const clock = new THREE.Clock();
+
+function render() {
+  const cpuStart = performance.now();
+  const dt = clock.getDelta();
+  const now = performance.now();
+
+  fleetMaterial.uniforms.uTime.value += dt;
+
+  // ---- interpolation ------------------------------------------------------
+  // Render at (now - INTERP_DELAY_MS), expressed as a fraction between the two
+  // snapshots we hold. alpha < 1 means we are interpolating (good). alpha
+  // pinned at 1 every frame means packets are arriving late and we are
+  // extrapolating, which is what stutter looks like from the inside.
+  const span = Math.max(1, currTime - prevTime);
+  let alpha = (now - INTERP_DELAY_MS - prevTime) / span;
+  alpha = Math.min(1, Math.max(0, alpha));
+
+  for (let i = 0; i < robotCount; i++) {
+    const o = i * ROBOT_FLOATS;
+
+    const px = prevData[o],     pz = prevData[o + 1], ph = prevData[o + 2];
+    const cx = currData[o],     cz = currData[o + 1], ch = currData[o + 2];
+
+    const x = px + (cx - px) * alpha;
+    const z = pz + (cz - pz) * alpha;
+
+    // Headings must not lerp through the long way round the circle.
+    let dh = ch - ph;
+    while (dh >  Math.PI) dh -= Math.PI * 2;
+    while (dh < -Math.PI) dh += Math.PI * 2;
+    const heading = ph + dh * alpha;
+
+    aStatus.array[i] = currData[o + 4];
+    aKind.array[i]   = currData[o + 5];
+    aSpeed.array[i]  = prevData[o + 3] + (currData[o + 3] - prevData[o + 3]) * alpha;
+
+    _p.set(x, 0.25, z);
+    _e.set(0, heading, 0);
+    _q.setFromEuler(_e);
+    _m.compose(_p, _q, _s);
+    fleetMesh.setMatrixAt(i, _m);
+  }
+
+  fleetMesh.instanceMatrix.needsUpdate = true;
+  aStatus.needsUpdate = aKind.needsUpdate = aSpeed.needsUpdate = true;
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  // ---- metrics ------------------------------------------------------------
+  cpuAccum += performance.now() - cpuStart;
+  fpsAccum += dt;
+  frames++;
+  if (fpsAccum >= 0.5) {
+    const fps = frames / fpsAccum;
+    const cpu = cpuAccum / frames;
+    const el = document.getElementById('m-cpu');
+    el.textContent = cpu.toFixed(2) + ' ms';
+    el.className = cpu > 13.9 ? 'bad' : cpu > 8 ? 'warn' : '';
+    document.getElementById('m-fps').textContent = fps.toFixed(0);
+    document.getElementById('m-draws').textContent = renderer.info.render.calls;
+    document.getElementById('m-robots').textContent = robotCount;
+    document.getElementById('m-lat').textContent = netLatency.toFixed(1) + ' ms';
+    frames = 0; fpsAccum = 0; cpuAccum = 0;
+  }
+}
+
+renderer.setAnimationLoop(render);   // NOT requestAnimationFrame: in an XR
+                                     // session the headset drives the clock.
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
