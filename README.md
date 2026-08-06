@@ -4,7 +4,7 @@ A web page where you can watch a warehouse full of robots move around in 3D, cli
 
 Everything runs on your own machine. No accounts, no cloud services, no build step.
 
-![screenshot](/screenshot.png)
+![screenshot](/ss.png)
 
 <!-- Take a screenshot of the running app and save it as docs/screenshot.png -->
 
