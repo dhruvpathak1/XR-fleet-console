@@ -1,158 +1,138 @@
-<<<<<<< HEAD
 # XR Fleet Operations Console
 
-A browser-based operations console for a simulated robot fleet. A Python
-backend runs a multi-agent warehouse simulation and streams robot poses over a
-binary WebSocket at a fixed 20 Hz. A WebXR-capable three.js frontend renders
-the entire fleet in a single instanced draw call with a hand-written GLSL
-shader, interpolates between server snapshots, and lets you select a robot and
-send it to a cell either with a mouse or with an XR controller.
+A web page where you can watch a warehouse full of robots move around in 3D, click one, and tell it where to go. It also works in VR.
 
-```
-server/main.py     FastAPI + WebSocket, 20 Hz fixed-tick fleet simulation
-web/index.html     three.js + WebXR client, single file, no build step
-```
+Everything runs on your own machine. No accounts, no cloud services, no build step.
 
-## Run it
+![screenshot](/screenshot.png)
 
-Requires Python 3.10+.
+<!-- Take a screenshot of the running app and save it as docs/screenshot.png -->
+
+## What it does
+
+- A Python program pretends to be a warehouse with up to 3000 robots in it. The robots pick destinations, drive toward them, and get out of each other's way.
+- Twenty times a second, it sends every robot's position to your browser.
+- Your browser draws all of them in 3D, in real time.
+- You can click a robot to select it, then click the floor to send it there.
+- If you have a VR headset, you can put it on and see the warehouse as a table-sized model in front of you, and point at robots with the controller.
+
+Colours tell you what each robot is doing:
+
+| Colour | Meaning |
+|---|---|
+| Blue to green | Driving. Greener means faster. |
+| Amber | Blocked. Something is in the way. |
+| Grey | Idle. Sitting at its destination. |
+| Flashing white | Currently selected. |
+
+## Getting started
+
+You need **Python 3.10 or newer**. Check with `python3 --version`.
+
+**1. Open a terminal in the project folder.**
+
+**2. Create a virtual environment.** This keeps the project's packages separate from the rest of your system.
 
 ```bash
-cd xr-fleet-console
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r server/requirements.txt
-python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>.
+**3. Activate it.**
 
-`localhost` counts as a secure context, which is what WebXR requires, so no TLS
-setup is needed for local development. The frontend is served by the same
-FastAPI process as the WebSocket, so there is no CORS configuration and no
-second dev server.
+```bash
+source .venv/bin/activate          # macOS / Linux
+.venv\Scripts\activate             # Windows
+```
 
-**Controls.** Drag to orbit. Click a robot to select it, then click the floor to
-send it there. The "Enter VR" button appears when a WebXR device or emulator is
-available; in a session, the controller trigger does both actions.
+You'll know it worked when `(.venv)` appears at the start of your terminal prompt.
 
-**Without a headset.** Install the
-[WebXR API Emulator](https://chromewebstore.google.com/detail/webxr-api-emulator/mjddjgeghkdijejnciaefnkjmkafnnje)
-extension for Chrome, open DevTools, pick the WebXR tab, and choose a device.
-That is enough to develop and demo the immersive path. It is **not** enough to
-claim a measured on-device frame rate. If you own an Android phone with ARCore,
-Chrome there runs real WebXR sessions and gives you a genuine device number.
+**4. Install the two packages it needs.**
 
-## What to look at in the HUD
+```bash
+pip install -r server/requirements.txt
+```
 
-| Field | What it tells you |
+**5. Start it.**
+
+```bash
+python -m uvicorn server.main:app --port 8000
+```
+
+**6. Open <http://127.0.0.1:8000> in your browser.**
+
+You should see a dark grid with a few hundred small blocks moving around on it.
+
+To stop the server, press `Ctrl+C` in the terminal.
+
+## How to use it
+
+| Action | How |
 |---|---|
-| `cpu frame` | JS time per frame. Turns amber over 8 ms, red over 13.9 ms. |
-| `budget @72Hz` | 13.9 ms. A Quest at 72 Hz gives you this much for *both* eyes. |
-| `draw calls` | Should stay at roughly 4 whether you render 100 or 3000 robots. |
-| `net latency` | Mean gap between server packets. Should hover near 50 ms at 20 Hz. |
+| Look around | Click and drag |
+| Zoom | Scroll |
+| Select a robot | Click it |
+| Send it somewhere | With a robot selected, click a spot on the floor |
+| Change fleet size | Use the dropdown, bottom left |
+| Shuffle destinations | Click "Scatter goals" |
+| Freeze everything | Click "Pause" |
 
-Change the robot count in the dropdown and watch `draw calls` refuse to move.
-That is the whole point of instancing.
+The panel in the top left shows live statistics. The one worth watching is **draw calls**: switch from 100 robots to 3000 and notice it barely changes. That is the main trick this project is built around, explained below.
 
-## Design decisions worth defending
 
-**One instanced draw call, not N meshes.** Draw calls are CPU-side driver
-validation and state setup. XR pays that cost twice, once per eye. 3000
-separate meshes will stall long before 3000 instances will.
+To try the VR view without owning a headset, install the free
+[WebXR API Emulator](https://chromewebstore.google.com/detail/webxr-api-emulator/mjddjgeghkdijejnciaefnkjmkafnnje)
+extension for Chrome, then open DevTools (F12), find the **WebXR** tab, and pick a device. The "Enter VR" button will start working.
 
-**Binary frames, not JSON.** A frame is `16 + 24 * N` bytes: 12 KB for 500
-robots, 72 KB for 3000. At 20 Hz, JSON would mean building and parsing
-thousands of objects per second on the render thread, and the garbage collector
-would show up as periodic frame spikes.
+## How it works
 
-**Fixed 20 Hz sim, decoupled from render rate.** Simulation must not depend on
-how fast the client's GPU happens to be. The client renders 60 ms in the past
-so it always has two snapshots to interpolate between, rather than
-extrapolating past the newest data every frame.
+```
+   Python (server)                          Browser (client)
+   ┌──────────────────┐                     ┌──────────────────┐
+   │  warehouse sim   │   20 times/second   │  three.js draws  │
+   │  moves robots    │ ──── positions ───► │  all robots in   │
+   │  20 times/second │                     │  3D, 60+ fps     │
+   │                  │ ◄─── commands ───── │  you click stuff │
+   └──────────────────┘                     └──────────────────┘
+```
 
-**Preallocated buffers, no per-frame allocation.** Instance matrices and
-attribute arrays are written in place. One reused `Matrix4`, not 500 new ones
-per frame.
+Three ideas do most of the work:
 
-**GPU-side animation.** The aerial hover bob runs in the vertex shader from a
-uniform clock. Doing it on the CPU would mean rewriting every instance matrix
-each frame for a purely cosmetic effect.
+**Drawing 3000 robots as if they were one object.** Normally, each object you draw costs the graphics card a separate instruction from the CPU. Three thousand robots would mean three thousand instructions per frame, and everything would crawl. Instead all robots share one shape and one instruction, with a list of positions attached. This is called *instancing*. It's why the "draw calls" number stays flat no matter how many robots there are.
 
-**Two-cell reservation during transit.** A robot holds both the cell it is
-leaving and the cell it has reserved, releasing the origin only on arrival.
-Releasing at departure lets another robot claim a cell that is still physically
-occupied, and they visibly overlap mid-crossing.
+**Sending positions as raw numbers, not text.** Most web apps send data as JSON, which is text your browser has to read and convert. At twenty updates a second with hundreds of robots, that adds up fast. This sends the numbers directly instead: 24 bytes per robot, about 12 KB per update for 500 robots. The browser reads them without any conversion work.
 
-**Deadlock escape.** Strict prioritised planning with no alternative action
-gridlocks: every robot waits on a cell held by another waiting robot. Measured
-on this map it degraded from about 20% blocked to 77% blocked within 120 ticks
-and never recovered. After four blocked ticks a robot will accept any free
-neighbour, even one that increases its distance to goal. Taking a locally worse
-move to break a global deadlock is the entire idea. With the escape action the
-blocked fraction plateaus around 11 to 17% at 500 robots.
+**Smoothing between updates.** The server only sends positions 20 times a second, but the screen refreshes 60 or more times a second. If the browser just drew the newest position each time, the robots would visibly stutter. Instead it deliberately draws what happened 60 milliseconds ago, which lets it blend smoothly between the last two updates.
 
-## Verified
+There is more detail, including the bugs found while building this and how they were fixed, in [NOTES.md](NOTES.md).
 
-Checked programmatically against a running server:
+## Project structure
 
-- 20.3 Hz sustained tick rate, contiguous tick numbers, no dropped frames
-- Frame size exactly matches the declared wire format at 500 and 3000 robots
-- All robots stay inside world bounds; no NaN; status and kind always in range
-- Per-tick displacement never exceeds max speed times dt (no teleporting)
-- Zero same-plane robot pairs closer than 0.75 world units (no clipping)
-- 500 goal commands applied over the WebSocket; mean grid distance to the
-  commanded corner fell from 39.4 to 22.2 over 300 ticks
-- Pause freezes the tick counter; resize reallocates and re-acks correctly
-- Frontend passes `node --check` with no syntax errors
+```
+server/
+  main.py            the warehouse simulation and the WebSocket server
+  requirements.txt   the two packages needed
+web/
+  index.html         the entire frontend: 3D view, shaders, controls
+```
 
-Frontend raycasting was verified separately by running three.js headless in
-Node with the same camera, rig transform and instance layout: every on-screen
-robot projects to a pixel that raycasts back to its own `instanceId`.
+That's it. Two files of real code. The frontend loads three.js straight from a CDN, so there is no `npm install` and no build step.
 
-**Not verified:** the frontend has not been rendered by a real GPU or a headset
-from this environment. Run it, confirm it draws, and record your own frame
-numbers before quoting any.
+## Built with
 
-### Fixed after first run
+| Piece | What it does |
+|---|---|
+| [Python](https://www.python.org/) + [FastAPI](https://fastapi.tiangolo.com/) | Runs the simulation, serves the page, handles the WebSocket |
+| [three.js](https://threejs.org/) | Draws 3D graphics in the browser |
+| [WebXR](https://immersiveweb.dev/) | The browser standard for VR and AR |
+| GLSL | The small shader program that colours each robot on the graphics card |
+| WebSockets | Keeps a live two-way connection open between browser and server |
 
-The first version scaled the world rig to 0.06 permanently, for XR ergonomics.
-On desktop that made every robot about **0.4 pixels tall**: technically
-rendered, technically clickable by a raycast, impossible to see or hit with a
-mouse. The rig is now 1:1 on desktop and only shrinks to a tabletop diorama on
-`sessionstart`. Related fixes: fog moved out past the camera distance, a manual
-bounding sphere on the `InstancedMesh` so `raycast()` cannot early-out on a
-stale cached sphere, robot bodies enlarged to most of a cell, and selection
-moved to `pointerup` with a 5 px threshold so orbit drags no longer fire a
-selection.
+## Known limitations
 
-## Before you put this on a resume
+- The robots are simulated. There is no real hardware behind this.
+- Path planning is deliberately simple: robots move along one axis, then the other. It is not A* and it is not optimal.
+- Tested on desktop Chrome. The VR path has been tested with the WebXR emulator, not on a physical headset.
 
-Answer these four without looking at the code. If you cannot, the project is a
-liability in an interview, not an asset.
+## License
 
-1. Why one `InstancedMesh` instead of 500 meshes? What specifically gets
-   expensive, and why does XR make it worse?
-2. Why binary over the wire instead of JSON at 20 Hz? Name the two costs.
-3. Why render 60 ms in the past instead of drawing the newest snapshot
-   immediately? What does the failure look like on screen?
-4. What is your per-frame budget at 72 Hz, and what is your measured `cpu frame`
-   at 500 robots on your machine?
-
-There are also two marked exercises in the shader in `web/index.html`. Work
-through them. They are the difference between having used a shader and
-understanding one.
-
-## Honest resume line
-
-Only claim what you measured on your own hardware:
-
-> Rendered a 500 robot fleet in a WebXR-capable three.js console, batched all
-> agents into a single instanced draw call with a custom GLSL shader and
-> interpolated 20 Hz binary pose updates streamed from a FastAPI WebSocket
-> backend, sustaining NN fps at N.N ms CPU frame time.
-
-Do not write "shipped to headset" unless you shipped to a headset.
-=======
-# XR-fleet-console
->>>>>>> 5073bcaaeebf8b57fe14f098cfd0c47764d335d8
+MIT
